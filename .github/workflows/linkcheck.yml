@@ -16,7 +16,6 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Optional: shard across 4 parallel runners for speed (adjust as desired)
     strategy:
       matrix:
         shard: [0, 1, 2, 3]
@@ -54,9 +53,9 @@ jobs:
           name: link-reports
           path: reports/*.csv
 
-  merge:
+  combine:
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,9 +76,10 @@ jobs:
           name: link-reports
           path: reports
 
-     - name: Merge CSVs and commit
-  run: |
-    python - <<'PY'
+      - name: Merge CSVs and commit
+        shell: bash
+        run: |
+          python - <<'PY'
 import glob, os, sys
 import pandas as pd
 
@@ -94,9 +94,8 @@ os.makedirs("reports", exist_ok=True)
 out.to_csv("reports/link_report.csv", index=False)
 print(f"Merged {len(files)} shards into reports/link_report.csv")
 PY
-    git config user.name "github-actions"
-    git config user.email "github-actions@users.noreply.github.com"
-    git add reports/link_report.csv
-    git commit -m "Update link report [skip ci]" || echo "No changes to commit"
-    git push
-
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add reports/link_report.csv
+          git commit -m "Update link report [skip ci]" || echo "No changes to commit"
+          git push

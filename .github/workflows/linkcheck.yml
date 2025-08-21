@@ -77,21 +77,26 @@ jobs:
           name: link-reports
           path: reports
 
-      - name: Merge CSVs and commit
-        run: |
-          python - << 'PY'
+     - name: Merge CSVs and commit
+  run: |
+    python - <<'PY'
+import glob, os, sys
 import pandas as pd
-import glob
-import os
+
 files = sorted(glob.glob("reports/link_report_shard*.csv"))
+if not files:
+    print("No shard CSVs found; nothing to merge.")
+    sys.exit(0)
+
 dfs = [pd.read_csv(f) for f in files]
 out = pd.concat(dfs, ignore_index=True)
 os.makedirs("reports", exist_ok=True)
 out.to_csv("reports/link_report.csv", index=False)
-print("Merged", len(files), "shards into reports/link_report.csv")
+print(f"Merged {len(files)} shards into reports/link_report.csv")
 PY
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add reports/link_report.csv
-          git commit -m "Update link report [skip ci]" || echo "No changes to commit"
-          git push
+    git config user.name "github-actions"
+    git config user.email "github-actions@users.noreply.github.com"
+    git add reports/link_report.csv
+    git commit -m "Update link report [skip ci]" || echo "No changes to commit"
+    git push
+

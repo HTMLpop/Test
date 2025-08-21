@@ -83,7 +83,6 @@ jobs:
 import pandas as pd
 import glob
 import os
-
 files = sorted(glob.glob("reports/link_report_shard*.csv"))
 dfs = [pd.read_csv(f) for f in files]
 out = pd.concat(dfs, ignore_index=True)

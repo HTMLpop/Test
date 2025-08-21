@@ -1,0 +1,95 @@
+name: Weekly Link Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: 'Print every URL status'
+        required: false
+        default: 'true'
+  schedule:
+    - cron: '0 9 * * 1' # Mondays 09:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Optional: shard across 4 parallel runners for speed (adjust as desired)
+    strategy:
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run link checker
+        env:
+          PYTHONUNBUFFERED: "1"   # ensure live logs
+        run: |
+          python -u check_links.py \
+            --input data/urls.xlsx \
+            --output reports/link_report_shard${{ matrix.shard }}.csv \
+            --output-xlsx "" \
+            --shard-index ${{ matrix.shard }} \
+            --shard-count 4 \
+            --concurrency 100 \
+            $([ "${{ github.event.inputs.verbose }}" = "true" ] && echo --verbose)
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-reports
+          path: reports/*.csv
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pandas
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: link-reports
+          path: reports
+
+      - name: Merge CSVs and commit
+        run: |
+          python - << 'PY'
+import pandas as pd, glob, os
+files = sorted(glob.glob("reports/link_report_shard*.csv"))
+dfs = [pd.read_csv(f) for f in files]
+out = pd.concat(dfs, ignore_index=True)
+os.makedirs("reports", exist_ok=True)
+out.to_csv("reports/link_report.csv", index=False)
+print("Merged", len(files), "shards into reports/link_report.csv")
+PY
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add reports/link_report.csv
+          git commit -m "Update link report [skip ci]" || echo "No changes to commit"
+          git push

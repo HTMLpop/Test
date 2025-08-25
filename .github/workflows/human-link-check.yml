@@ -16,7 +16,7 @@ jobs:
       SHEET: Sheet1
       SHARDS: 8
       REPO_NAME: Test
-      URL_COLS: "Masking Forms_URL (Column E),Fraud/Alerts_URLs (Column G),Public Records Request Form_URLs (Column I)"
+      URL_COLS: "Masking Forms_URL,Fraud/Alerts_URLs,Public Records Request Form_URLs"
 
     steps:
       - name: Checkout
@@ -66,15 +66,18 @@ jobs:
               print("Copied CSV to urls.csv")
           PY
 
-      - name: Inspect input headers (debug)
-        run: |
-          python - <<'PY'
-          import pandas as pd
-          df = pd.read_csv('urls.csv')
-          print('Columns:', list(df.columns))
-          print('Rows:', len(df))
-          print(df.head(3).to_string())
-          PY
+       - name: Inspect input headers (debug)
+         run: |
+            python - <<'PY'
+            import pandas as pd, re
+            df = pd.read_csv('urls.csv')
+            def norm(s): return re.sub(r'[^a-z0-9]+',' ', str(s).lower()).strip()
+            print('Columns:', list(df.columns))
+            print('Normalized keys:', [norm(c) for c in df.columns])
+            print('Rows:', len(df))
+            print(df.head(3).to_string())
+            PY
+
 
       - name: Split into shards
         run: |
@@ -95,8 +98,8 @@ jobs:
         run: |
           python human_link_check.py \
             --input urls_shard_${{ matrix.shard }}.csv \
-            --concurrency 20 \
-            --timeout-ms 12000 \
+            --concurrency 24 \
+            --timeout-ms 10000 \
             --output-csv shard_${{ matrix.shard }}_results.csv \
             --output-json shard_${{ matrix.shard }}_results.json \
             ${URL_COLS:+--url-cols "$URL_COLS"}

@@ -1,0 +1,152 @@
+name: Weekly Human Link Check (Playwright)
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+  workflow_dispatch:      # allows manual runs
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 8 parallel shards for speed
+    env:
+      # You said the file is "Test/combined_master_with_urls.xlsx"
+      # This workflow tries that path, OR the root version without "Test/".
+      INPUT_FILE: Test/combined_master_with_urls.xlsx
+      SHEET: Sheet1          # change to your actual sheet name, or leave blank to use the first sheet
+      SHARDS: 8
+      REPO_NAME: Test        # used to strip the repo name from paths if included
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      # Resolve the real path (handles common "repo-name/prefix" mistake)
+      - name: Resolve input path and convert Excel->CSV if needed
+        id: convert
+        run: |
+          python - <<'PY'
+          import os, sys, pandas as pd, pathlib, shutil
+          repo_name = os.environ.get("REPO_NAME","")
+          raw = os.environ["INPUT_FILE"]
+
+          # Try multiple candidates
+          candidates = [raw]
+          parts = pathlib.PurePosixPath(raw).parts
+          if parts and repo_name and parts[0].lower() == repo_name.lower():
+              # Strip leading repo folder if present
+              candidates.append("/".join(parts[1:]))
+          # Also try basename at repo root
+          candidates.append(os.path.basename(raw))
+
+          chosen = None
+          for c in candidates:
+              if c and os.path.exists(c):
+                  chosen = c
+                  break
+
+          if not chosen:
+              raise FileNotFoundError(f"Could not find any of: {candidates}")
+
+          print(f"Using input file: {chosen}")
+
+          # Normalize to CSV named urls.csv
+          if chosen.lower().endswith((".xlsx",".xls")):
+              sheet = os.environ.get("SHEET") or None
+              df = pd.read_excel(chosen, sheet_name=sheet)
+              df.to_csv("urls.csv", index=False)
+              print("Converted Excel to urls.csv")
+          else:
+              shutil.copyfile(chosen, "urls.csv")
+              print("Copied CSV to urls.csv")
+          PY
+
+      - name: Split into shards
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          shards = int(os.environ['SHARDS'])
+          shard  = int(os.environ['MatrixShard'])
+          df = pd.read_csv('urls.csv').reset_index(drop=True)
+          sub = df[df.index % shards == shard]
+          out = f'urls_shard_{shard}.csv'
+          sub.to_csv(out, index=False)
+          print(f'Shard {shard}: {len(sub)} rows -> {out}')
+          PY
+        env:
+          MatrixShard: ${{ matrix.shard }}
+
+      - name: Run checker (shard)
+        run: |
+          python human_link_check.py \
+            --input urls_shard_${{ matrix.shard }}.csv \
+            --concurrency 6 \
+            --timeout-ms 25000 \
+            --output-csv shard_${{ matrix.shard }}_results.csv \
+            --output-json shard_${{ matrix.shard }}_results.json
+
+      - name: Upload artifacts (per shard)
+        uses: actions/upload-artifact@v4
+        with:
+          name: human-link-check-${{ matrix.shard }}
+          path: |
+            shard_${{ matrix.shard }}_results.csv
+            shard_${{ matrix.shard }}_results.json
+            screenshots/
+          retention-days: 7
+
+  aggregate:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: human-link-check-*
+          merge-multiple: true
+
+      - name: Merge shard result files
+        run: |
+          python - <<'PY'
+          import glob, pandas as pd, json
+          csvs = sorted(glob.glob('shard_*_results.csv'))
+          if csvs:
+              df = pd.concat([pd.read_csv(c) for c in csvs], ignore_index=True)
+              df.to_csv('all_results.csv', index=False)
+              print(f"Merged {len(csvs)} CSVs -> all_results.csv with {len(df)} rows")
+          else:
+              print("No shard CSVs found")
+
+          jsons = sorted(glob.glob('shard_*_results.json'))
+          big = []
+          for j in jsons:
+              with open(j, 'r', encoding='utf-8') as f:
+                  big += json.load(f)
+          if big:
+              with open('all_results.json', 'w', encoding='utf-8') as f:
+                  json.dump(big, f, ensure_ascii=False, indent=2)
+              print(f"Merged {len(jsons)} JSONs -> all_results.json with {len(big)} entries")
+          else:
+              print("No shard JSONs found")
+          PY
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@v4
+        with:
+          name: human-link-check-all
+          path: |
+            all_results.csv
+            all_results.json

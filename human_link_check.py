@@ -3,34 +3,32 @@
 FAST human-reachable URL checker.
 
 Design:
-- Stage 1 (fast, default): concurrent HTTP HEAD→GET using aiohttp (no browser).
-  • Counts as WORKING if we can reach the server and get:
-      - 2xx–3xx status (OK/redirect)
-      - 403 (treat as working per request)
-      - 401 (working, gated/auth)
-      - 429 (working, rate-limited)
-  • 404/410 -> not_working
-  • 5xx -> not_working
-  • Timeouts/DNS/SSL errors -> not_working (with reason)
-  • If GET body is HTML and contains common bot walls/CAPTCHAs, mark status=challenge
-    (verdict = working (bot-blocked))
+- Stage 1 (fast): concurrent HTTP HEAD→GET using aiohttp (no browser).
+  Counts as WORKING if we can reach the server and get:
+    • 2xx–3xx (OK/redirect)
+    • 403 (working per request)
+    • 401 (working, gated/auth)
+    • 429 (working, rate-limited)
+  404/410 -> not_working
+  5xx     -> not_working
+  Timeouts/DNS/SSL -> not_working (with reason)
+  If GET HTML contains bot-wall/CAPTCHA phrases -> status=challenge (verdict=working (bot-blocked))
 
-- Stage 2 (optional): Playwright browser fallback ONLY if requested via --browser-fallback,
-  used when Stage 1 is inconclusive. (We keep this optional for speed.)
+- No screenshots. Browser fallback removed for speed (can be re-added if you want).
 
 Multi-column & robust parsing:
-- Use --url-cols "Col A,Col B,Col C" (case-insensitive; whitespace-normalized).
-- Extracts URLs from mixed-text cells; ignores blanks/NaN; dedupes.
+- Use --url-cols "Col A,Col B,Col C"
+- Fuzzy header matching: case-insensitive, whitespace & punctuation normalized
+- Extracts URLs from mixed-text cells; ignores blanks/NaN; dedupes
 
 Verdicts:
-  reachable           -> working
-  protected (401/forbidden/gated) -> working (gated)
-  challenge (CAPTCHA/bot wall)    -> working (bot-blocked)
-  403                               -> working (403)
-  429                               -> working (rate-limited)
-  broken/5xx/404/410               -> not_working
-  dns_error                         -> not_working (dns)
-  timeout                           -> inconclusive (timeout)
+  reachable                     -> working
+  protected (401/forbidden)     -> working (gated)
+  challenge (CAPTCHA/bot wall)  -> working (bot-blocked)
+  403                           -> working (403)
+  429                           -> working (rate-limited)
+  404/410/5xx/connection errors -> not_working / not_working (dns)
+  timeout                       -> inconclusive (timeout)
 """
 
 import asyncio
@@ -55,6 +53,7 @@ CHALLENGE_PATTERNS = [
     r"cf-chl", r"cdn-cgi", r"akamai", r"perimeterx", r"datadome", r"sucuri",
 ]
 PROTECTED_PATTERNS = [r"sign in", r"log in", r"forbidden", r"not authorized"]
+
 URL_FIND_RE = re.compile(
     r'((?:https?://|ftp://)[^\s<>"\'\)\]]+|'
     r'www\.[^\s<>"\'\)\]]+|'
@@ -62,6 +61,7 @@ URL_FIND_RE = re.compile(
 )
 TRAILING_PUNCT = '.,);]}>\"\''
 WS_NORM_RE = re.compile(r'\s+', re.UNICODE)
+PUNC_NORM_RE = re.compile(r'[^a-z0-9]+')  # for header normalization
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/127.0.0.0 Safari/537.36")
@@ -72,7 +72,8 @@ def normalize_ws(s: str) -> str:
     return WS_NORM_RE.sub(' ', s.strip())
 
 def normalize_col_key(s: str) -> str:
-    return normalize_ws(str(s)).lower()
+    # Lowercase, remove all punctuation to be robust to slashes/parentheses/etc.
+    return PUNC_NORM_RE.sub(' ', str(s).lower()).strip()
 
 def extract_urls_from_cell(val) -> list[str]:
     if val is None:
@@ -108,12 +109,10 @@ def classify_text(text: str) -> str:
     return "unknown"
 
 def verdict_from_status(status: str, http_status: int | None) -> str:
-    # Forced working classes first
     if status == "challenge":
         return "working (bot-blocked)"
     if status == "protected":
         return "working (gated)"
-    # HTTP-code based mapping
     if http_status is not None:
         if 200 <= http_status < 400:
             return "working"
@@ -127,7 +126,6 @@ def verdict_from_status(status: str, http_status: int | None) -> str:
             return "not_working"
         if 500 <= http_status < 600:
             return "not_working"
-    # Non-HTTP classes
     if status == "dns_error":
         return "not_working (dns)"
     if status == "timeout":
@@ -141,7 +139,9 @@ def verdict_from_status(status: str, http_status: int | None) -> str:
 # ---------- URL collection ----------
 
 def collect_urls(df, url_col: str | None, url_cols: list[str] | None):
+    # Build normalized map of actual headers
     col_map = {normalize_col_key(c): c for c in df.columns}
+
     selected_cols = []
     if url_cols:
         for raw in url_cols:
@@ -150,6 +150,7 @@ def collect_urls(df, url_col: str | None, url_cols: list[str] | None):
                 selected_cols.append(col_map[key])
             else:
                 print(f"[warn] URL column not found (fallback to scan-all if none match): {raw}", file=sys.stderr)
+
     scan_all = False
     if url_cols and not selected_cols:
         scan_all = True
@@ -173,7 +174,7 @@ def collect_urls(df, url_col: str | None, url_cols: list[str] | None):
             for c in df.columns:
                 add_series(df[c])
 
-    # dedupe
+    # dedupe (preserve order)
     seen, deduped = set(), []
     for u in urls:
         if u not in seen:
@@ -190,41 +191,57 @@ async def fast_probe(session: aiohttp.ClientSession, url: str, timeout_ms: int):
     result = {
         "url": url, "final_url": None, "http_status": None,
         "status": "broken", "title": None, "notes": "", "elapsed_sec": None,
-        "screenshot": None,  # kept for schema compatibility
+        "screenshot": None,  # keep column for compatibility
         "verdict": "unknown",
     }
     t0 = time.time()
     try:
-        # HEAD first
+        # HEAD (fast)
         try:
             async with session.head(url, allow_redirects=True) as r:
                 result["http_status"] = r.status
                 result["final_url"] = str(r.url)
-                # If good code, classify quickly
-                if 200 <= r.status < 400 or r.status in (401, 403, 429):
-                    result["status"] = "reachable" if 200 <= r.status < 400 else \
-                                       ("protected" if r.status == 401 else "challenge" if r.status in (403,) else "reachable")
+                if 200 <= r.status < 400:
+                    result["status"] = "reachable"
+                    result["notes"] += f"[HEAD {r.status}] "
+                elif r.status == 401:
+                    result["status"] = "protected"
+                    result["notes"] += "[HEAD 401] "
+                elif r.status == 403:
+                    result["status"] = "challenge"   # will map to working
+                    result["notes"] += "[HEAD 403] "
+                elif r.status == 429:
+                    result["status"] = "reachable"   # rate-limited but reachable
+                    result["notes"] += "[HEAD 429] "
+                elif r.status in (404, 410):
+                    result["status"] = "broken"
+                    result["notes"] += f"[HEAD {r.status}] "
+                elif 500 <= r.status < 600:
+                    result["status"] = "broken"
                     result["notes"] += f"[HEAD {r.status}] "
         except aiohttp.ClientResponseError as e:
             result["http_status"] = e.status
             result["notes"] += f"[HEAD error {e.status}] "
+        except asyncio.CancelledError:
+            result["status"] = "broken"
+            result["notes"] += "[HEAD cancelled] "
         except Exception as e:
-            result["notes"] += f"[HEAD exception {type(e).__name__}] "
+            result["notes"] += f"[HEAD {type(e).__name__}] "
 
-        # If we still don't have a decisive answer or want HTML signals, do a tiny GET
+        # Decide if GET needed
         need_get = True
         if result["http_status"] is not None:
             if (200 <= result["http_status"] < 400) or result["http_status"] in (401, 403, 429, 404, 410, *range(500,600)):
-                need_get = False  # already decisive
+                need_get = False
 
         if need_get:
             async with session.get(url, allow_redirects=True) as r:
                 result["http_status"] = r.status
                 result["final_url"] = str(r.url)
-                ctype = r.headers.get("Content-Type", "")
-                # Peek limited body for CAPTCHA/bot-wall signals (HTML only)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+
                 body_text = ""
-                if "html" in ctype.lower():
+                if "html" in ctype:
                     body_bytes = await r.content.read(65536)
                     try:
                         body_text = body_bytes.decode(errors="ignore")
@@ -233,22 +250,19 @@ async def fast_probe(session: aiohttp.ClientSession, url: str, timeout_ms: int):
                     cls = classify_text(body_text)
                     if cls == "challenge":
                         result["status"] = "challenge"
-                        result["notes"] += "[GET challenge detected] "
+                        result["notes"] += "[GET challenge] "
                     elif cls == "protected":
                         result["status"] = "protected"
-                        result["notes"] += "[GET protected/gated] "
+                        result["notes"] += "[GET protected] "
 
-                # If not set by challenge/protected, map by code
                 if result["status"] not in ("challenge", "protected"):
                     if 200 <= r.status < 400:
                         result["status"] = "reachable"
                     elif r.status == 401:
                         result["status"] = "protected"
                     elif r.status == 403:
-                        # Treat as working (bot-blocked)
                         result["status"] = "challenge"
                     elif r.status == 429:
-                        # Treat as working (rate-limited)
                         result["status"] = "reachable"
                         result["notes"] += "[rate-limited] "
                     elif r.status in (404, 410):
@@ -258,7 +272,7 @@ async def fast_probe(session: aiohttp.ClientSession, url: str, timeout_ms: int):
                     else:
                         result["status"] = "broken"
 
-                if "html" not in ctype.lower():
+                if "html" not in ctype:
                     result["notes"] += f"[{r.status} {ctype}] "
 
         result["elapsed_sec"] = round(time.time() - t0, 2)
@@ -272,16 +286,24 @@ async def fast_probe(session: aiohttp.ClientSession, url: str, timeout_ms: int):
         result["notes"] += "[timeout] "
         return result
     except aiohttp.ClientConnectorError as e:
-        result["status"] = "dns_error" if "Name or service not known" in str(e) or "nodename nor servname provided" in str(e) else "broken"
+        # DNS-ish
+        msg = str(e).lower()
+        result["status"] = "dns_error" if ("name or service not known" in msg or "nodename nor servname" in msg or "temporary failure in name resolution" in msg) else "broken"
         result["elapsed_sec"] = round(time.time() - t0, 2)
         result["verdict"] = verdict_from_status(result["status"], result["http_status"])
         result["notes"] += f"[connect {type(e).__name__}] "
         return result
-    except ssl.SSLError as e:
+    except ssl.SSLError:
         result["status"] = "broken"
         result["elapsed_sec"] = round(time.time() - t0, 2)
         result["verdict"] = verdict_from_status(result["status"], result["http_status"])
         result["notes"] += "[ssl error] "
+        return result
+    except asyncio.CancelledError:
+        result["status"] = "broken"
+        result["elapsed_sec"] = round(time.time() - t0, 2)
+        result["verdict"] = verdict_from_status(result["status"], result["http_status"])
+        result["notes"] += "[cancelled] "
         return result
     except Exception as e:
         result["status"] = "broken"
@@ -290,65 +312,10 @@ async def fast_probe(session: aiohttp.ClientSession, url: str, timeout_ms: int):
         result["notes"] += f"[error {type(e).__name__}] "
         return result
 
-# ---------- Optional browser fallback (kept minimal; disabled by default) ----------
-
-async def browser_fallback_check(url: str, timeout_ms: int):
-    try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-    except Exception:
-        return None  # playwright not available
-
-    result = {
-        "url": url, "final_url": None, "http_status": None,
-        "status": "broken", "title": None, "notes": "[browser fallback] ",
-        "elapsed_sec": None, "screenshot": None, "verdict": "unknown",
-    }
-    t0 = time.time()
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True, args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-default-browser-check","--disable-gpu","--disable-dev-shm-usage","--no-sandbox",
-            ])
-            ctx = await browser.new_context(
-                locale="en-US", timezone_id="America/New_York",
-                user_agent=UA, viewport={"width":1366,"height":768},
-                java_script_enabled=True, ignore_https_errors=False,
-                extra_http_headers={"Accept-Language":"en-US,en;q=0.9","DNT":"1","Upgrade-Insecure-Requests":"1"},
-            )
-            page = await ctx.new_page()
-            page.set_default_navigation_timeout(timeout_ms)
-            page.set_default_timeout(timeout_ms)
-            resp = await page.goto(url, wait_until="domcontentloaded")
-            if resp:
-                result["http_status"] = resp.status
-            await page.wait_for_load_state("networkidle", timeout=timeout_ms//2)
-            result["final_url"] = page.url
-            txt = ""
-            try:
-                txt = await page.inner_text("body")
-            except Exception:
-                pass
-            cls = classify_text(txt)
-            if cls == "challenge":
-                result["status"] = "challenge"
-            elif cls == "protected":
-                result["status"] = "protected"
-            else:
-                result["status"] = "reachable"
-            await ctx.close()
-            await browser.close()
-    except Exception as e:
-        result["status"] = "broken"
-        result["notes"] += f"[fallback error {type(e).__name__}] "
-    result["elapsed_sec"] = round(time.time() - t0, 2)
-    result["verdict"] = verdict_from_status(result["status"], result["http_status"])
-    return result
-
 # ---------- Orchestration ----------
 
 async def run_checker(input_path: str, sheet: str | None, url_col: str | None, url_cols: list[str] | None,
-                      concurrency: int, timeout_ms: int, browser_fallback: bool,
+                      concurrency: int, timeout_ms: int,
                       output_csv: str, output_json: str):
     ip = Path(input_path)
     if not ip.exists():
@@ -363,24 +330,28 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str | None, u
 
     timeout = ClientTimeout(total=timeout_ms/1000.0, connect=5, sock_read=7)
     ssl_ctx = ssl.create_default_context()
-    connector = aiohttp.TCPConnector(limit=concurrency*2, ssl=ssl_ctx)
+    connector = aiohttp.TCPConnector(limit=concurrency*2, ssl=ssl_ctx, ttl_dns_cache=60)
     headers = {"User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "DNT": "1"}
 
     sem = asyncio.Semaphore(concurrency)
     results = [None] * len(urls)
 
-    async def task(i, u):
-        async with sem:
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
-                fast_res = await fast_probe(session, u, timeout_ms=timeout_ms)
-            if browser_fallback and fast_res["verdict"] in ("unknown", "not_working", "inconclusive (timeout)"):
-                fb = await browser_fallback_check(u, timeout_ms=timeout_ms)
-                if fb and fb["verdict"].startswith("working"):
-                    results[i] = fb
-                    return
-            results[i] = fast_res
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        async def task(i, u):
+            async with sem:
+                res = await fast_probe(session, u, timeout_ms=timeout_ms)
+                results[i] = res
 
-    await asyncio.gather(*[task(i, u) for i, u in enumerate(urls)])
+        # Gather robustly (don't abort everything on one failure)
+        finished = await asyncio.gather(*[task(i, u) for i, u in enumerate(urls)], return_exceptions=True)
+        # Replace exceptions (should be rare due to handling) with synthetic "broken"
+        for i, item in enumerate(finished):
+            if isinstance(item, Exception) and results[i] is None:
+                results[i] = {
+                    "url": urls[i], "final_url": None, "http_status": None,
+                    "status": "broken", "title": None, "notes": f"[gather {type(item).__name__}]", "elapsed_sec": None,
+                    "screenshot": None, "verdict": "not_working"
+                }
 
     out_df = pd.DataFrame(results)
     out_df.to_csv(output_csv, index=False)
@@ -388,20 +359,19 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str | None, u
     print(f"Wrote: {output_csv} ({len(out_df)} rows)")
 
 def main():
-    p = argparse.ArgumentParser(description="Fast human-reachable URL checker (HTTP-first; optional browser fallback).")
+    p = argparse.ArgumentParser(description="Fast human-reachable URL checker (HTTP-only).")
     p.add_argument("--input", required=True, help="Path to input Excel/CSV")
     p.add_argument("--sheet", default=None, help="Excel sheet name (if Excel).")
     p.add_argument("--url-col", default=None, help="Single URL column name.")
     p.add_argument("--url-cols", default=None, help="Comma-separated list of URL column names.")
-    p.add_argument("--concurrency", type=int, default=20, help="Parallel HTTP checks per shard.")
-    p.add_argument("--timeout-ms", type=int, default=12000, help="Per-URL total timeout (ms).")
-    p.add_argument("--browser-fallback", action="store_true", help="Use Playwright only on inconclusive results.")
+    p.add_argument("--concurrency", type=int, default=24, help="Parallel HTTP checks per shard.")
+    p.add_argument("--timeout-ms", type=int, default=10000, help="Per-URL total timeout (ms).")
     p.add_argument("--output-csv", default="link_check_results.csv")
     p.add_argument("--output-json", default="link_check_results.json")
     args = p.parse_args()
     url_cols = [c.strip() for c in args.url_cols.split(",")] if args.url_cols else None
     asyncio.run(run_checker(args.input, args.sheet, args.url_col, url_cols,
-                            args.concurrency, args.timeout_ms, args.browser_fallback,
+                            args.concurrency, args.timeout_ms,
                             args.output_csv, args.output_json))
 
 if __name__ == "__main__":

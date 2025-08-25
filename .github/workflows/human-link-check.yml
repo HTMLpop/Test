@@ -1,16 +1,16 @@
-name: Weekly Human Link Check (Playwright)
+name: Weekly Human Link Check (FAST)
 
 on:
   schedule:
     - cron: "0 9 * * 1"   # Mondays 09:00 UTC
-  workflow_dispatch:      # allows manual runs
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 8 parallel shards for speed
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 8 parallel shards
     env:
       INPUT_FILE: Test/combined_master_with_urls.xlsx
       SHEET: Sheet1
@@ -31,13 +31,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install chromium
 
-      # Resolve path and convert Excel -> urls.csv (handles "Test/" prefix)
       - name: Resolve input path and convert Excel->CSV if needed
         run: |
           python - <<'PY'
-          import os, sys, pandas as pd, pathlib, shutil
+          import os, pandas as pd, pathlib, shutil
           repo_name = os.environ.get("REPO_NAME","")
           raw = os.environ["INPUT_FILE"]
 
@@ -68,7 +66,6 @@ jobs:
               print("Copied CSV to urls.csv")
           PY
 
-      # Debug print: columns + first 3 rows (helps catch header mismatches)
       - name: Inspect input headers (debug)
         run: |
           python - <<'PY'
@@ -76,7 +73,7 @@ jobs:
           df = pd.read_csv('urls.csv')
           print('Columns:', list(df.columns))
           print('Rows:', len(df))
-          print('Head:\n', df.head(3).to_string())
+          print(df.head(3).to_string())
           PY
 
       - name: Split into shards
@@ -94,12 +91,12 @@ jobs:
         env:
           MatrixShard: ${{ matrix.shard }}
 
-      - name: Run checker (shard)
+      - name: Run checker (shard; fast-only)
         run: |
           python human_link_check.py \
             --input urls_shard_${{ matrix.shard }}.csv \
-            --concurrency 6 \
-            --timeout-ms 25000 \
+            --concurrency 20 \
+            --timeout-ms 12000 \
             --output-csv shard_${{ matrix.shard }}_results.csv \
             --output-json shard_${{ matrix.shard }}_results.json \
             ${URL_COLS:+--url-cols "$URL_COLS"}
@@ -111,7 +108,6 @@ jobs:
           path: |
             shard_${{ matrix.shard }}_results.csv
             shard_${{ matrix.shard }}_results.json
-            screenshots/
           retention-days: 7
 
   aggregate:
@@ -129,38 +125,36 @@ jobs:
           python - <<'PY'
           import csv, glob, json
 
-          # Merge CSVs
           csvs = sorted(glob.glob('shard_*_results.csv'))
           if csvs:
-              headers = None
-              rows = []
-              for c in csvs:
-                  with open(c, newline='', encoding='utf-8') as f:
-                      r = csv.DictReader(f)
-                      if headers is None:
-                          headers = r.fieldnames
-                      for row in r:
-                          rows.append(row)
-              with open('all_results.csv', 'w', newline='', encoding='utf-8') as f:
-                  w = csv.DictWriter(f, fieldnames=headers)
-                  w.writeheader()
-                  w.writerows(rows)
-              print(f"Merged {len(csvs)} CSVs -> all_results.csv with {len(rows)} rows")
+            headers = None
+            rows = []
+            for c in csvs:
+              with open(c, newline='', encoding='utf-8') as f:
+                r = csv.DictReader(f)
+                if headers is None:
+                  headers = r.fieldnames
+                for row in r:
+                  rows.append(row)
+            with open('all_results.csv', 'w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=headers)
+              w.writeheader()
+              w.writerows(rows)
+            print(f"Merged {len(csvs)} CSVs -> all_results.csv with {len(rows)} rows")
           else:
-              print("No shard CSVs found")
+            print("No shard CSVs found")
 
-          # Merge JSONs
           jsons = sorted(glob.glob('shard_*_results.json'))
           big = []
           for j in jsons:
-              with open(j, 'r', encoding='utf-8') as f:
-                  big += json.load(f)
+            with open(j, 'r', encoding='utf-8') as f:
+              big += json.load(f)
           if big:
-              with open('all_results.json', 'w', encoding='utf-8') as f:
-                  json.dump(big, f, ensure_ascii=False, indent=2)
-              print(f"Merged {len(jsons)} JSONs -> all_results.json with {len(big)} entries")
+            with open('all_results.json', 'w', encoding='utf-8') as f:
+              json.dump(big, f, ensure_ascii=False, indent=2)
+            print(f"Merged {len(jsons)} JSONs -> all_results.json with {len(big)} entries")
           else:
-              print("No shard JSONs found")
+            print("No shard JSONs found")
           PY
 
       - name: Upload combined results

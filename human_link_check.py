@@ -1,34 +1,32 @@
-
 #!/usr/bin/env python3
 """
 Human-reachable URL checker using Playwright (Chromium).
 
-Goal: Decide if a typical human using a real browser could reach each URL,
-even if basic bot-like requests fail. We use a real browser, execute JS,
-wait for redirects, and detect common bot-challenge interstitials.
+Features:
+- Real browser (Chromium via Playwright) with JS + redirects + light scrolling
+- Detects bot walls (Cloudflare/Akamai/PerimeterX/Datadome/etc.)
+- Supports multiple URL columns via --url-cols "ColA,ColB,ColC"
+- Ignores empty/NaN cells and dedupes URLs
+- Adds a 'verdict' column aligned with your rule:
+    reachable  -> working
+    protected  -> working (gated)
+    challenge  -> working (bot-blocked)
+    broken     -> not_working
+    dns_error  -> not_working (dns)
+    timeout    -> inconclusive (timeout)
 
-Input:  Excel/CSV with a column named "url" (case-insensitive).
 Outputs:
-  - CSV: link_check_results.csv
+  - CSV: link_check_results.csv (or per-shard names if passed via args)
+  - JSON: link_check_results.json
   - Folder: screenshots/ (PNG per URL)
-  - Optional: JSON summary per run (link_check_results.json)
 
 Install (first time):
   python -m pip install -r requirements.txt
   python -m playwright install chromium
 
-Usage:
-  python human_link_check.py --input urls.xlsx --sheet Sheet1 --concurrency 6
-  # or CSV:
+Examples:
+  python human_link_check.py --input urls.xlsx --sheet Sheet1 --url-cols "A,B,C" --concurrency 6
   python human_link_check.py --input urls.csv --concurrency 6
-
-Notes:
-  - Heuristics classify pages as: reachable | challenge | protected | broken | timeout | dns_error.
-  - "reachable" means we loaded non-challenge content in a real browser context.
-  - "challenge" means anti-bot wall detected (e.g., Cloudflare "Just a moment...") and not bypassed within timeout.
-  - "protected" means site is up but requires auth or is geo/IP blocked; a human could reach landing page but content gated.
-  - "broken" means HTTP error (4xx/5xx) or fatal nav error likely not due to bot checks.
-  - Headless is used; for stubborn sites, try --headed for a quick pass locally.
 """
 
 import asyncio
@@ -40,11 +38,9 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-
 
 # ----------------------- Heuristics & Utilities -----------------------
 
@@ -74,6 +70,20 @@ PROTECTED_PATTERNS = [
     r"geo.?blocked",
 ]
 
+URL_REGEX = re.compile(
+    r"^(?:https?://|www\.)"
+    r"|"
+    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$",
+    re.IGNORECASE,
+)
+
+def looks_like_url(s: str) -> bool:
+    if s is None:
+        return False
+    s = str(s).strip()
+    if not s or s.lower() == "nan":
+        return False
+    return bool(URL_REGEX.search(s))
 
 def classify_page_text(text: str) -> str:
     t = (text or "").lower()
@@ -84,7 +94,6 @@ def classify_page_text(text: str) -> str:
         if re.search(pat, t):
             return "protected"
     return "unknown"
-
 
 def normalize_url(u: str) -> str:
     if not u:
@@ -97,12 +106,25 @@ def normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-
 def is_probably_html(content_type: str | None) -> bool:
     if not content_type:
         return True  # many sites don't set it properly
     return "text/html" in content_type.lower() or "application/xhtml+xml" in content_type.lower()
 
+def verdict_from_status(status: str) -> str:
+    if status == "reachable":
+        return "working"
+    if status == "protected":
+        return "working (gated)"
+    if status == "challenge":
+        return "working (bot-blocked)"
+    if status == "dns_error":
+        return "not_working (dns)"
+    if status == "broken":
+        return "not_working"
+    if status == "timeout":
+        return "inconclusive (timeout)"
+    return "unknown"
 
 # ----------------------- Core Checker -----------------------
 
@@ -116,6 +138,7 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
         "notes": "",
         "elapsed_sec": None,
         "screenshot": None,
+        "verdict": "unknown",
     }
 
     start = time.time()
@@ -125,7 +148,6 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
             locale="en-US",
             timezone_id="America/New_York",
             user_agent=(
-                # Recent stable Chrome UA (Windows 10 x64)
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/127.0.0.0 Safari/537.36"
@@ -133,7 +155,6 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
             viewport={"width": 1366, "height": 768},
             java_script_enabled=True,
             ignore_https_errors=False,
-            # Extra HTTP headers to look more like a real browser session
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
                 "DNT": "1",
@@ -142,28 +163,22 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
         )
         page = await context.new_page()
 
-        # Set a reasonable default timeout for each step
         page.set_default_navigation_timeout(timeout_ms)
         page.set_default_timeout(timeout_ms)
 
-        # Navigate
         resp = await page.goto(url, wait_until="domcontentloaded")
 
-        # If MIME type looks non-HTML, still allow (some sites serve weird headers)
         if resp:
             result["http_status"] = resp.status
             ct = resp.headers.get("content-type", "")
             if not is_probably_html(ct):
-                # Still try to load; but mark note
                 result["notes"] += f"[non-HTML content-type: {ct}] "
 
-        # Give pages time to redirect/execute JS
         try:
             await page.wait_for_load_state("networkidle", timeout=timeout_ms // 2)
         except PWTimeout:
             pass
 
-        # Light human-like interaction: small scroll to trigger lazy loads
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
             await asyncio.sleep(0.3)
@@ -173,14 +188,12 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
         except Exception:
             pass
 
-        # Gather info
         result["final_url"] = page.url
         try:
             result["title"] = await page.title()
         except Exception:
             result["title"] = None
 
-        # Heuristic: page text size & challenge detection
         body_text = ""
         try:
             body_text = await page.inner_text("body")
@@ -189,7 +202,6 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
         except Exception:
             pass
 
-        # Another hint: presence of visible h1 or main content
         has_h1 = False
         try:
             h1 = await page.locator("h1").first.text_content(timeout=1000)
@@ -217,11 +229,11 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
             else:
                 result["status"] = "broken"
 
-        # Screenshot (for debugging)
         if screenshot_dir:
             screenshot_dir.mkdir(parents=True, exist_ok=True)
+            import re as _re
             from urllib.parse import urlparse as _urlparse
-            fname = re.sub(r"[^a-zA-Z0-9_-]+", "_", (_urlparse(result["final_url"] or url).netloc or "page"))
+            fname = _re.sub(r"[^a-zA-Z0-9_-]+", "_", (_urlparse(result["final_url"] or url).netloc or "page"))
             ts = int(time.time() * 1000)
             path = screenshot_dir / f"{fname}_{ts}.png"
             try:
@@ -243,7 +255,6 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
     except Exception as e:
         msg = f"[error: {type(e).__name__}: {e}] "
         result["notes"] += msg
-        # crude DNS hint
         if "ERR_NAME_NOT_RESOLVED" in msg or "getaddrinfo failed" in msg or "Name or service not known" in msg:
             result["status"] = "dns_error"
         else:
@@ -256,8 +267,8 @@ async def check_url(browser, url: str, timeout_ms: int = 25000, headed: bool = F
         except Exception:
             pass
 
+    result["verdict"] = verdict_from_status(result["status"])
     return result
-
 
 async def worker(name: int, queue: asyncio.Queue, browser, results: list, timeout_ms: int, screenshot_dir: Path):
     while True:
@@ -275,9 +286,38 @@ async def worker(name: int, queue: asyncio.Queue, browser, results: list, timeou
         finally:
             queue.task_done()
 
+def collect_urls(df, url_col: str | None, url_cols: list[str] | None):
+    urls = []
 
-async def run_checker(input_path: str, sheet: str | None, url_col: str, concurrency: int, timeout_ms: int, headed: bool, output_csv: str, output_json: str):
-    # Load URLs
+    def add_series(series):
+        for val in series.astype(str).tolist():
+            if looks_like_url(val):
+                urls.append(normalize_url(val))
+
+    if url_cols:
+        for c in url_cols:
+            if c in df.columns:
+                add_series(df[c])
+            else:
+                print(f"[warn] url column not found: {c}", file=sys.stderr)
+    elif url_col and url_col in df.columns:
+        add_series(df[url_col])
+    else:
+        # Fallback: scan all columns for values that look like URLs
+        for c in df.columns:
+            add_series(df[c])
+
+    # dedupe while preserving order
+    seen = set()
+    deduped = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    return deduped
+
+async def run_checker(input_path: str, sheet: str | None, url_col: str | None, url_cols: list[str] | None,
+                      concurrency: int, timeout_ms: int, headed: bool, output_csv: str, output_json: str):
     input_path = Path(input_path)
     if not input_path.exists():
         print(f"Input not found: {input_path}", file=sys.stderr)
@@ -288,27 +328,23 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str, concurre
     else:
         df = pd.read_csv(input_path)
 
-    # Find URL column (case-insensitive), default "url"
-    url_candidates = [c for c in df.columns if c.lower() == url_col.lower()]
-    if not url_candidates:
-        # Try to infer: first column containing something that looks like a URL
-        for c in df.columns:
-            if df[c].astype(str).str.contains(r"https?://|www\.", case=False, regex=True).any():
-                url_candidates = [c]
-                break
-    if not url_candidates:
-        print("Could not find a URL column. Please specify with --url-col", file=sys.stderr)
-        sys.exit(2)
-    url_col = url_candidates[0]
-
-    urls = [normalize_url(str(u)) for u in df[url_col].astype(str).tolist() if str(u).strip()]
+    urls = collect_urls(df, url_col=url_col, url_cols=url_cols)
     n = len(urls)
+    if n == 0:
+        # Write empty outputs and succeed so empty shards don't fail the job
+        pd.DataFrame([], columns=[
+            "url","final_url","status","http_status","title","notes","elapsed_sec","screenshot","verdict"
+        ]).to_csv(output_csv, index=False)
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        print("No URLs found in this shard; wrote empty results.")
+        return
+
     results = [None] * n
 
     screenshot_dir = Path("screenshots")
     screenshot_dir.mkdir(exist_ok=True)
 
-    # Launch browser
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not headed, args=[
             "--disable-blink-features=AutomationControlled",
@@ -318,7 +354,6 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str, concurre
             "--no-sandbox",
         ])
 
-        # Producer-Consumer
         queue = asyncio.Queue()
         for i, u in enumerate(urls):
             queue.put_nowait((i, u))
@@ -326,7 +361,6 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str, concurre
         workers = []
         for w in range(concurrency):
             workers.append(asyncio.create_task(worker(w+1, queue, browser, results, timeout_ms, screenshot_dir)))
-        # Add sentinels
         for _ in workers:
             queue.put_nowait(None)
 
@@ -335,7 +369,6 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str, concurre
             w.cancel()
         await browser.close()
 
-    # Save outputs
     out_df = pd.DataFrame(results)
     out_df.to_csv(output_csv, index=False)
     with open(output_json, "w", encoding="utf-8") as f:
@@ -345,12 +378,12 @@ async def run_checker(input_path: str, sheet: str | None, url_col: str, concurre
     print(f"Wrote: {output_json}")
     print(f"Screenshots: {screenshot_dir.resolve()}")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Human-reachable URL checker using a real browser (Playwright).")
     parser.add_argument("--input", required=True, help="Path to input Excel/CSV")
     parser.add_argument("--sheet", default=None, help="Excel sheet name (if Excel).")
-    parser.add_argument("--url-col", default="url", help="Column name containing URLs (case-insensitive).")
+    parser.add_argument("--url-col", default=None, help="Single column name containing URLs (case-insensitive).")
+    parser.add_argument("--url-cols", default=None, help="Comma-separated list of URL column names (e.g., 'A,B,C').")
     parser.add_argument("--concurrency", type=int, default=6, help="How many pages to check in parallel.")
     parser.add_argument("--timeout-ms", type=int, default=25000, help="Per-URL timeout in milliseconds.")
     parser.add_argument("--headed", action="store_true", help="Run with a visible browser (for local debugging).")
@@ -358,17 +391,19 @@ def main():
     parser.add_argument("--output-json", default="link_check_results.json", help="Path for results JSON.")
     args = parser.parse_args()
 
+    url_cols = [c.strip() for c in args.url_cols.split(",")] if args.url_cols else None
+
     asyncio.run(run_checker(
         input_path=args.input,
         sheet=args.sheet,
         url_col=args.url_col,
+        url_cols=url_cols,
         concurrency=args.concurrency,
         timeout_ms=args.timeout_ms,
         headed=args.headed,
         output_csv=args.output_csv,
         output_json=args.output_json
     ))
-
 
 if __name__ == "__main__":
     main()

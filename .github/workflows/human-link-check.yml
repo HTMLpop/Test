@@ -12,12 +12,11 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]   # 8 parallel shards for speed
     env:
-      # You said the file is "Test/combined_master_with_urls.xlsx"
-      # This workflow tries that path, OR the root version without "Test/".
       INPUT_FILE: Test/combined_master_with_urls.xlsx
-      SHEET: Sheet1          # change to your actual sheet name, or leave blank to use the first sheet
+      SHEET: Sheet1
       SHARDS: 8
-      REPO_NAME: Test        # used to strip the repo name from paths if included
+      REPO_NAME: Test
+      URL_COLS: "Masking Forms_URL (Column E),Fraud/Alerts_URLs (Column G),Public Records Request Form_URLs (Column I)"
 
     steps:
       - name: Checkout
@@ -34,22 +33,18 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      # Resolve the real path (handles common "repo-name/prefix" mistake)
+      # Resolve path and convert Excel -> urls.csv (handles "Test/" prefix)
       - name: Resolve input path and convert Excel->CSV if needed
-        id: convert
         run: |
           python - <<'PY'
           import os, sys, pandas as pd, pathlib, shutil
           repo_name = os.environ.get("REPO_NAME","")
           raw = os.environ["INPUT_FILE"]
 
-          # Try multiple candidates
           candidates = [raw]
           parts = pathlib.PurePosixPath(raw).parts
           if parts and repo_name and parts[0].lower() == repo_name.lower():
-              # Strip leading repo folder if present
               candidates.append("/".join(parts[1:]))
-          # Also try basename at repo root
           candidates.append(os.path.basename(raw))
 
           chosen = None
@@ -63,7 +58,6 @@ jobs:
 
           print(f"Using input file: {chosen}")
 
-          # Normalize to CSV named urls.csv
           if chosen.lower().endswith((".xlsx",".xls")):
               sheet = os.environ.get("SHEET") or None
               df = pd.read_excel(chosen, sheet_name=sheet)
@@ -96,7 +90,8 @@ jobs:
             --concurrency 6 \
             --timeout-ms 25000 \
             --output-csv shard_${{ matrix.shard }}_results.csv \
-            --output-json shard_${{ matrix.shard }}_results.json
+            --output-json shard_${{ matrix.shard }}_results.json \
+            ${URL_COLS:+--url-cols "$URL_COLS"}
 
       - name: Upload artifacts (per shard)
         uses: actions/upload-artifact@v4
@@ -118,18 +113,32 @@ jobs:
           pattern: human-link-check-*
           merge-multiple: true
 
-      - name: Merge shard result files
+      - name: Merge shard results (no pandas)
         run: |
           python - <<'PY'
-          import glob, pandas as pd, json
+          import csv, glob, json
+
+          # Merge CSVs
           csvs = sorted(glob.glob('shard_*_results.csv'))
           if csvs:
-              df = pd.concat([pd.read_csv(c) for c in csvs], ignore_index=True)
-              df.to_csv('all_results.csv', index=False)
-              print(f"Merged {len(csvs)} CSVs -> all_results.csv with {len(df)} rows")
+              headers = None
+              rows = []
+              for c in csvs:
+                  with open(c, newline='', encoding='utf-8') as f:
+                      r = csv.DictReader(f)
+                      if headers is None:
+                          headers = r.fieldnames
+                      for row in r:
+                          rows.append(row)
+              with open('all_results.csv', 'w', newline='', encoding='utf-8') as f:
+                  w = csv.DictWriter(f, fieldnames=headers)
+                  w.writeheader()
+                  w.writerows(rows)
+              print(f"Merged {len(csvs)} CSVs -> all_results.csv with {len(rows)} rows")
           else:
               print("No shard CSVs found")
 
+          # Merge JSONs
           jsons = sorted(glob.glob('shard_*_results.json'))
           big = []
           for j in jsons:

@@ -68,6 +68,17 @@ jobs:
               print("Copied CSV to urls.csv")
           PY
 
+      # Debug print: columns + first 3 rows (helps catch header mismatches)
+      - name: Inspect input headers (debug)
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv('urls.csv')
+          print('Columns:', list(df.columns))
+          print('Rows:', len(df))
+          print('Head:\n', df.head(3).to_string())
+          PY
+
       - name: Split into shards
         run: |
           python - <<'PY'

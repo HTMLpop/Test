@@ -5,8 +5,10 @@ Human-reachable URL checker using Playwright (Chromium).
 Features:
 - Real browser (Chromium via Playwright) with JS + redirects + light scrolling
 - Detects bot walls (Cloudflare/Akamai/PerimeterX/Datadome/etc.)
-- Supports multiple URL columns via --url-cols "ColA,ColB,ColC"
-- Ignores empty/NaN cells and dedupes URLs
+- Multiple URL columns via --url-cols "ColA,ColB,ColC"
+- Ignores empty/NaN cells, extracts URLs from mixed-text cells, and dedupes
+- Robust column-name matching (case-insensitive; trims/normalizes whitespace)
+- Falls back to scanning ALL columns if none of the requested names match
 - Adds a 'verdict' column aligned with your rule:
     reachable  -> working
     protected  -> working (gated)
@@ -23,10 +25,6 @@ Outputs:
 Install (first time):
   python -m pip install -r requirements.txt
   python -m playwright install chromium
-
-Examples:
-  python human_link_check.py --input urls.xlsx --sheet Sheet1 --url-cols "A,B,C" --concurrency 6
-  python human_link_check.py --input urls.csv --concurrency 6
 """
 
 import asyncio
@@ -70,20 +68,46 @@ PROTECTED_PATTERNS = [
     r"geo.?blocked",
 ]
 
-URL_REGEX = re.compile(
-    r"^(?:https?://|www\.)"
-    r"|"
-    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$",
-    re.IGNORECASE,
+# Find URLs *inside* cells (http(s), www., or bare domains)
+URL_FIND_RE = re.compile(
+    r'((?:https?://|ftp://)[^\s<>"\'\)\]]+|'
+    r'www\.[^\s<>"\'\)\]]+|'
+    r'(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s<>"\'\)\]]*)?)'
 )
 
-def looks_like_url(s: str) -> bool:
-    if s is None:
-        return False
-    s = str(s).strip()
-    if not s or s.lower() == "nan":
-        return False
-    return bool(URL_REGEX.search(s))
+TRAILING_PUNCT = '.,);]}>\"\''
+WS_NORM_RE = re.compile(r'\s+', re.UNICODE)
+
+def normalize_ws(s: str) -> str:
+    return WS_NORM_RE.sub(' ', s.strip())
+
+def normalize_col_key(s: str) -> str:
+    # Lowercase, collapse spaces, strip
+    return normalize_ws(str(s)).lower()
+
+def extract_urls_from_cell(val) -> list[str]:
+    if val is None:
+        return []
+    s = str(val)
+    if not s.strip():
+        return []
+    urls = []
+    for m in URL_FIND_RE.finditer(s):
+        candidate = m.group(0).strip().strip(TRAILING_PUNCT)
+        if candidate:
+            urls.append(candidate)
+    return urls
+
+def normalize_url(u: str) -> str:
+    if not u:
+        return u
+    u = u.strip()
+    if not u:
+        return u
+    # If missing scheme, assume https
+    if not re.match(r"^(?:https?|ftp)://", u, re.I):
+        u = "https://" + u
+    return u
 
 def classify_page_text(text: str) -> str:
     t = (text or "").lower()
@@ -94,17 +118,6 @@ def classify_page_text(text: str) -> str:
         if re.search(pat, t):
             return "protected"
     return "unknown"
-
-def normalize_url(u: str) -> str:
-    if not u:
-        return u
-    u = u.strip()
-    if not u:
-        return u
-    # If missing scheme, assume https
-    if not re.match(r"^https?://", u, re.I):
-        u = "https://" + u
-    return u
 
 def is_probably_html(content_type: str | None) -> bool:
     if not content_type:
@@ -287,27 +300,44 @@ async def worker(name: int, queue: asyncio.Queue, browser, results: list, timeou
             queue.task_done()
 
 def collect_urls(df, url_col: str | None, url_cols: list[str] | None):
-    urls = []
+    # Build normalized column lookup
+    col_map = {normalize_col_key(c): c for c in df.columns}
 
-    def add_series(series):
-        for val in series.astype(str).tolist():
-            if looks_like_url(val):
-                urls.append(normalize_url(val))
-
+    selected_cols = []
     if url_cols:
-        for c in url_cols:
-            if c in df.columns:
-                add_series(df[c])
+        for raw in url_cols:
+            key = normalize_col_key(raw)
+            if key in col_map:
+                selected_cols.append(col_map[key])
             else:
-                print(f"[warn] url column not found: {c}", file=sys.stderr)
-    elif url_col and url_col in df.columns:
-        add_series(df[url_col])
-    else:
-        # Fallback: scan all columns for values that look like URLs
+                print(f"[warn] URL column not found (will try fallback later): {raw}", file=sys.stderr)
+
+    scan_all = False
+    if url_cols and not selected_cols:
+        print("[warn] None of the requested URL columns matched; scanning ALL columns instead.", file=sys.stderr)
+        scan_all = True
+
+    urls = []
+    def add_series(series):
+        for val in series.tolist():
+            for u in extract_urls_from_cell(val):
+                urls.append(normalize_url(u))
+
+    if scan_all:
         for c in df.columns:
             add_series(df[c])
+    else:
+        if selected_cols:
+            for c in selected_cols:
+                add_series(df[c])
+        elif url_col and normalize_col_key(url_col) in col_map:
+            add_series(df[col_map[normalize_col_key(url_col)]])
+        else:
+            # Fallback: scan all columns
+            for c in df.columns:
+                add_series(df[c])
 
-    # dedupe while preserving order
+    # Deduplicate, preserve order
     seen = set()
     deduped = []
     for u in urls:
